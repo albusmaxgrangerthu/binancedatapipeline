@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  crypto_pipeline:
+    build: . # Uses your Dockerfile
+    volumes:
+      # volumes: Maps local folders to container folders; This ensures your DuckDB database and logs persist even if container restarts.
+      - ${DATABASE_DIR}:/app/data # Use environment variable with default
+      - ./logs:/app/logs # Persists your logs
+    environment:
+      - TZ=Asia/Shanghai # Can Overrides TZ from Dockerfile
+      - DATABASE_DIR=/app/data # Note: This is the path inside the container
+      - BINANCE_API_KEY=${BINANCE_API_KEY}
+      - BINANCE_API_SECRET=${BINANCE_API_SECRET}
+      - COINGECKO_API_KEY=${COINGECKO_API_KEY}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+
+    restart: always # Automatically restart if crashes
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m" # Prevents logs from filling disk
+        max-file: "3" # Keeps last 3 log files
