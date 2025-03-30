@@ -1672,7 +1672,7 @@ class CryptoDataPipeline:
                 print(f"Failed to update {table_name}: {e}")
                 continue
         
-        for table_name in ['bn_margin_interest_rates','bn_funding_rates']:
+        for table_name in ['bn_funding_rates']:
             try:
                 print(f"\nUpdating {table_name}...")
                 self.update_market_data(self.table_configs[table_name], start_time, end_time)
@@ -1699,7 +1699,7 @@ class CryptoDataPipeline:
         start_time = None
         end_time = pd.Timestamp.now(tz='UTC').tz_localize(None)
 
-        for table_name in ['bn_margin_interest_rates','bn_funding_rates']:
+        for table_name in ['bn_funding_rates']:
             try:
                 print(f"\n=== Updating {table_name} ===")
                 self.update_market_data(self.table_configs[table_name], start_time, end_time)
