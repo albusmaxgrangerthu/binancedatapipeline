@@ -1498,18 +1498,27 @@ class CryptoDataPipeline:
         
     def _initialize_database(self):
         """Initialize database tables if they don't exist"""
-        with duckdb.connect(self.db_path) as con:
-            for config in self.table_configs.values():
-                columns_sql = ', '.join(f"{col} {dtype}" for col, dtype in config.columns.items())
-                primary_key_sql = ', '.join(config.primary_keys)
-                
-                create_table_sql = f"""
-                    CREATE TABLE IF NOT EXISTS {config.name} (
-                        {columns_sql},
-                        PRIMARY KEY ({primary_key_sql})
-                    )
-                """
-                con.execute(create_table_sql)
+        try:
+            if not Path(self.db_path).exists():
+                print(f"Database file {self.db_path} does not exist. Creating new database.")
+                Path(self.db_path).touch()
+            
+            with duckdb.connect(self.db_path) as con:
+                for config in self.table_configs.values():
+                    columns_sql = ', '.join(f"{col} {dtype}" for col, dtype in config.columns.items())
+                    primary_key_sql = ', '.join(config.primary_keys)
+                    
+                    create_table_sql = f"""
+                        CREATE TABLE IF NOT EXISTS {config.name} (
+                            {columns_sql},
+                            PRIMARY KEY ({primary_key_sql})
+                        )
+                    """
+                    con.execute(create_table_sql)
+        
+        except Exception as e:
+            print(f"Error initializing database: {e}")
+            raise
     
     def get_latest_update(self, con: duckdb.DuckDBPyConnection, config: TableConfig) -> Optional[datetime]:
         """Get the latest timestamp in a table"""
