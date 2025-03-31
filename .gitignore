@@ -1,0 +1,9 @@
+# Ignore sensitive and generated files
+.env
+*.db
+*.pyc
+app/src/__pycache__/
+app/src/crypto_data_pipeline.ipynb
+.DS_Store
+logs/
+data/
