@@ -38,8 +38,8 @@ BINANCE_API_KEY=your_binance_api_key
 BINANCE_API_SECRET=your_binance_api_secret
 COINGECKO_API_KEY=your_coingecko_api_key
 
-DATABASE_DIR=/app/data
-CODEBOOK_DIR=/app/codebook
+DATABASE_DIR=/data
+DATABASE_NAME=duckdb_crypto.db
 
 TELEGRAM_BOT_TOKEN=your_telegram_bot_token
 TELEGRAM_CHAT_ID=your_telegram_chat_id
