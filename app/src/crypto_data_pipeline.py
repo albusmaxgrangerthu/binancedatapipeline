@@ -1754,15 +1754,15 @@ class CryptoDataPipeline:
             
             return extreme_df.head(10)
 
-from dotenv import load_dotenv
-load_dotenv()
-pipeline = CryptoDataPipeline(
-            Path(os.getenv('DATABASE_DIR'))/'duckdb_crypto.db',
-            os.getenv('BINANCE_API_KEY'),
-            os.getenv('BINANCE_API_SECRET')
-        )
-print(pipeline.db_path)
-print(pipeline.fetcher.get_historical_funding_rate('BNXUSDT', '2025-01-20 00:00:00', '2025-03-22 16:30:00', delivery_date='2025-02-20 00:00:00'))
+#from dotenv import load_dotenv
+#load_dotenv()
+#pipeline = CryptoDataPipeline(
+#            Path(os.getenv('DATABASE_DIR'))/'duckdb_crypto.db',
+#            os.getenv('BINANCE_API_KEY'),
+#            os.getenv('BINANCE_API_SECRET')
+#        )
+#print(pipeline.db_path)
+#print(pipeline.fetcher.get_historical_funding_rate('BNXUSDT', '2025-01-20 00:00:00', '2025-03-22 16:30:00', delivery_date='2025-02-20 00:00:00'))
 #from dotenv import load_dotenv
 #load_dotenv()
 #fetcher = BinanceDataFetcher(db_path=Path(os.getenv('DATABASE_DIR'))/'duckdb_crypto.db', api_key=os.environ['BINANCE_API_KEY'], api_secret=os.environ['BINANCE_API_SECRET'])

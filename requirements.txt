@@ -9,6 +9,8 @@ requests==2.32.3
 
 # Database
 duckdb
+clickhouse-driver
+clickhouse-sqlalchemy
 
 # API and networking
 binance-connector
