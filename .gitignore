@@ -2,6 +2,7 @@
 .env
 *.db
 *.pyc
+*.ipynb
 app/src/__pycache__/
 app/src/crypto_data_pipeline.ipynb
 .DS_Store
