@@ -3,6 +3,7 @@ version: '3.8'
 services:
   crypto_pipeline:
     build: . # Uses your Dockerfile
+    network_mode: "host" # Add this line to use host network
     volumes:
       # volumes: Maps local folders to container folders; This ensures your DuckDB database and logs persist even if container restarts.
       - ${DATABASE_DIR}:/app/data # Use environment variable with default
@@ -15,6 +16,11 @@ services:
       - COINGECKO_API_KEY=${COINGECKO_API_KEY}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - CLICKHOUSE_HOST=localhost
+      - CLICKHOUSE_PORT=${CLICKHOUSE_PORT}
+      - CLICKHOUSE_DATABASE=${CLICKHOUSE_DATABASE}
+      - CLICKHOUSE_USERNAME=${CLICKHOUSE_USERNAME}
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD}
 
     restart: always # Automatically restart if crashes
     logging:

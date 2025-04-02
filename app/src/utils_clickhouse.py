@@ -1,16 +1,16 @@
 from utils import *
 from clickhouse_driver import Client
 
-def connect_clickhouse():
+def connect_clickhouse(host='localhost', port=9000, database='binance', username='max', password='chongma'):
     """Initialize connection to ClickHouse database"""
     try:
         # Initialize ClickHouse client with settings
         client = Client(
-            host=os.getenv('CLICKHOUSE_HOST'),
-            port=os.getenv('CLICKHOUSE_PORT'),
-            database=os.getenv('CLICKHOUSE_DATABASE'),
-            user=os.getenv('CLICKHOUSE_USER'),
-            password=os.getenv('CLICKHOUSE_PASSWORD'),
+            host=host,
+            port=port,
+            database=database,
+            user=username,
+            password=password,
             settings={
                 'use_numpy': True,
                 'max_memory_usage': 16 * 1024 * 1024 * 1024,  # 16GB

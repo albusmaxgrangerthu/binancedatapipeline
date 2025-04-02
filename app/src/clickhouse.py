@@ -54,6 +54,10 @@ FROM bn_perp_klines
 WHERE symbol = 'BTCUSDT'
 
 '''
+
+query = '''
+show tables 
+'''
 result = clickhouse_query(client, query)
 print(result)
 

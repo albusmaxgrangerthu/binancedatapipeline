@@ -734,6 +734,17 @@ class BinanceDataFetcher:
             # Process final results
             if all_results:
                 result = pd.concat(all_results, axis=0)
+                
+                # Handle empty or invalid values
+                numeric_cols = ['fundingRate', 'markPrice']
+                for col in numeric_cols:
+                    # Replace empty strings with NaN
+                    result[col] = pd.to_numeric(result[col], errors='coerce')
+                    
+                    # Optional: fill NaN with 0 or remove rows with NaN
+                    # result = result.dropna(subset=[col])  # Remove rows with NaN
+                    result[col] = result[col].fillna(0)  # Or fill with 0
+                
                 result = (result
                         .drop_duplicates(subset=['symbol', 'fundingTime'], keep='last')
                         .sort_values(['symbol', 'fundingTime'])
@@ -741,7 +752,7 @@ class BinanceDataFetcher:
 
                 if not result.empty:
                     result['fundingTime'] = pd.to_datetime(result['fundingTime'], unit='ms')
-                    result[['fundingRate', 'markPrice']] = result[['fundingRate', 'markPrice']].astype(float)
+                    #result[['fundingRate', 'markPrice']] = result[['fundingRate', 'markPrice']].astype(float)
                     result['exchange'] = 'binance'
                     result['type'] = 'PERPETUAL'
 
@@ -1711,37 +1722,37 @@ class CryptoDataPipeline:
     def validate_data(self):
         for type in ['perp', 'spot']:
             print(f"\nValidating {type} klines data...")
-            q = f'''
-            WITH latest_timestamps AS (
+            gaps_query = f'''
+            WITH time_diffs AS (
                 SELECT 
                     symbol,
-                    MIN(timestamp) as earliest_timestamp,
-                    MAX(timestamp) as latest_timestamp,
-                    DATEDIFF('hour', MIN(timestamp), MAX(timestamp)) as total_hours,
-                    COUNT(*) as total_rows
+                    timestamp,
+                    anyLast(timestamp) OVER (PARTITION BY symbol ORDER BY timestamp
+                        ROWS BETWEEN 1 FOLLOWING AND 1 FOLLOWING) as next_timestamp,
+                    dateDiff('hour', timestamp, 
+                        anyLast(timestamp) OVER (PARTITION BY symbol ORDER BY timestamp
+                            ROWS BETWEEN 1 FOLLOWING AND 1 FOLLOWING)
+                    ) as hours_diff
                 FROM bn_{type}_klines
-                GROUP BY symbol
-            ),
-
-            max_latest AS (
-                SELECT 
-                    symbol,
-                    earliest_timestamp,
-                    latest_timestamp,
-                    total_hours,
-                    total_rows,
-                    MAX(latest_timestamp) OVER () as max_latest_timestamp
-                FROM latest_timestamps
             )
-
-            SELECT
-                *
-            FROM max_latest
-            WHERE total_hours + 1 != total_rows
-            ORDER BY latest_timestamp ASC
+            SELECT 
+                symbol,
+                timestamp as gap_start,
+                next_timestamp as gap_end,
+                hours_diff as gap_hours
+            FROM time_diffs
+            WHERE hours_diff > 1  -- Gap larger than expected interval
+                AND next_timestamp is not null
+            ORDER BY gap_hours DESC
+            --LIMIT 20  -- Show top 20 largest gaps
             '''
-            df = clickhouse_query(self.con, q)
-            print(df)
+            print("\nChecking for time gaps...")
+            gaps_df = clickhouse_query(self.con, gaps_query)
+            if not gaps_df.empty:
+                print("\nFound time gaps:")
+                print(gaps_df)
+            else:
+                print("No time gaps found.")
     
     def get_extreme_cases(self, interval: int = 30, threshold_delta: float = -0.006, threshold_diff: int = 1440):
         """Get extreme cases for a table"""
@@ -1789,10 +1800,25 @@ class CryptoDataPipeline:
         return extreme_df.head(10)
 
 
-#from dotenv import load_dotenv
-#load_dotenv()
+'''
+from dotenv import load_dotenv
+load_dotenv()
 
-#pipeline = CryptoDataPipeline(con=connect_clickhouse(), klines_interval='1h', bn_api_key=os.environ['BINANCE_API_KEY'], bn_api_secret=os.environ['BINANCE_API_SECRET'])
+con = connect_clickhouse(
+    host=os.environ['CLICKHOUSE_HOST'],
+    port=os.environ['CLICKHOUSE_PORT'],
+    database=os.environ['CLICKHOUSE_DATABASE'],
+    username=os.environ['CLICKHOUSE_USERNAME'],
+    password=os.environ['CLICKHOUSE_PASSWORD']
+)
+
+pipeline = CryptoDataPipeline(
+    con=con, 
+    klines_interval='1h', 
+    bn_api_key=os.environ['BINANCE_API_KEY'], 
+    bn_api_secret=os.environ['BINANCE_API_SECRET']
+)
+#pipeline.update_all()
 #print(pipeline.fetcher.get_um_perpetual_symbols())
 #pipeline.update_market_data(pipeline.table_configs['bn_spot_symbols'])
 #pipeline.update_market_data(pipeline.table_configs['bn_perp_symbols'])
@@ -1801,7 +1827,17 @@ class CryptoDataPipeline:
 #    start_time=None, #'2025-02-22 07:52:00',
 #    end_time='2020-01-03 00:00:00'
 #)
-#pipeline.validate_data()
+pipeline.validate_data()
+df = pipeline.fetcher.get_historical_klines(
+    symbol='YFIUSDT',
+    start_time=int(pd.Timestamp('2020-11-30 00:00:00').timestamp()*1000),
+    end_time=int(pd.Timestamp('2020-11-30 12:00:00').timestamp()*1000),
+    interval='1h',
+    is_futures=False
+)
+df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+print(df[['symbol', 'timestamp', 'close', 'quote_volume']])
+'''
 #print(pipeline.fetcher.get_margin_interest_rate('BNX', start_time=int(pd.Timestamp('2025-01-20 00:00:00').timestamp()*1000), end_time=int(pd.Timestamp('2025-02-20 00:00:00').timestamp()*1000)))
 #print(pipeline.fetcher.get_historical_margin_interest_rate('BNX', '2025-01-20 00:00:00', '2025-03-22 16:30:00', list_date=None, delist_date=None))
 #fetcher = BinanceDataFetcher(con=connect_clickhouse(), api_key=os.environ['BINANCE_API_KEY'], api_secret=os.environ['BINANCE_API_SECRET'])
