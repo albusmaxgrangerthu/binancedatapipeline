@@ -122,9 +122,9 @@ if __name__ == "__main__":
     
     now = datetime.now()
     run_immediate = now.minute >= 58
-    next_run = now if run_immediate else None
+    next_run = now if run_immediate else now.replace(minute=58, second=0, microsecond=0)
     
-    # Add job to run at minute 59 of every hour
+    # Add job to run at minute 58 of every hour
     job = scheduler.add_job(
         job, 
         'cron', 
