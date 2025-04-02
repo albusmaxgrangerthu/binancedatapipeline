@@ -3,8 +3,7 @@
 *.db
 *.pyc
 *.ipynb
-app/src/__pycache__/
-app/src/crypto_data_pipeline.ipynb
 .DS_Store
+app/src/__pycache__/
 logs/
 data/

@@ -2,10 +2,7 @@ from utils import *
 import duckdb
 
 def connect_duckdb(dbname='duckdb_crypto.db'):
-    # create a tempfile name with random name
-    duckdb_temp = dbname
-    con = duckdb.connect(duckdb_temp)
-
+    
     credentials_path = Path(os.getenv('DATABASE_DIR'))/'credentials.txt'
     # another option is to read a file called credentials.txt
     if credentials_path.exists():
@@ -20,6 +17,8 @@ def connect_duckdb(dbname='duckdb_crypto.db'):
         with open(credentials_path, 'w') as f:
             f.write(password)      
    
+    # create a tempfile name with random name
+    con = duckdb.connect(dbname)
     
     # Combining Extensions for Efficient Data Pipeline:
     # FROM (

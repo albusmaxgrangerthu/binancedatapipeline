@@ -2,11 +2,9 @@
 from apscheduler.schedulers.blocking import BlockingScheduler
 import logging
 import sys
-import os
-from datetime import datetime
-import requests
-from pathlib import Path
-from crypto_data_pipeline import *
+from utils import *
+from utils_clickhouse import *
+from crypto_data_pipline_clickhouse import CryptoDataPipeline
 
 # Configure logging
 logging.basicConfig(
@@ -69,51 +67,37 @@ def job():
         logger.info("Starting update job...")
         
         # Initialize pipeline
-        pipeline = CryptoDataPipeline(
-            Path(os.getenv('DATABASE_DIR'))/'duckdb_crypto.db',
-            os.getenv('BINANCE_API_KEY'),
-            os.getenv('BINANCE_API_SECRET')
+        con = connect_clickhouse(
+            host=os.environ['CLICKHOUSE_HOST'],
+            port=os.environ['CLICKHOUSE_PORT'],
+            database=os.environ['CLICKHOUSE_DATABASE'],
+            username=os.environ['CLICKHOUSE_USERNAME'],
+            password=os.environ['CLICKHOUSE_PASSWORD']
         )
+        logger.info("Database connection established")
+
+        pipeline = CryptoDataPipeline(
+            con=con, 
+            klines_interval='1h', 
+            bn_api_key=os.environ['BINANCE_API_KEY'], 
+            bn_api_secret=os.environ['BINANCE_API_SECRET']
+        )
+        logger.info("Pipeline initialized")
         
         # Run update
         #pipeline.update_all()
         # Run timely updates (5-minute data)
-        logger.info("\n****** Running 5-minute updates ******")
-        pipeline.update_timely()
+        logger.info("\n****** Running 1-hour updates ******")
+        pipeline.update_all()
 
-        # Get extreme cases
-        result_df = pipeline.get_extreme_cases(interval=30, threshold_delta=-0.006, threshold_diff=1440)
-
-        # Run hourly updates if it's the start of an hour
-        if datetime.now().minute < 5:  # Run hourly updates in first 5 minutes of each hour
-            logger.info("\n****** Running hourly updates ******")
-            pipeline.update_hourly()
+        message = (
+            "✅ Pipeline Update Successful\n\n"
+            f"⏱️ Execution Time: {(datetime.now() - start_time).total_seconds():.2f}s\n"
+            f"🔄 Updated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        )
         
-        # Calculate execution time
-        execution_time = (datetime.now() - start_time).total_seconds()
-        
-        if not result_df.empty:
-            time_diff = (datetime.now() - result_df.fundingTime_cn[0]).total_seconds()
-            if time_diff < 900:
-                # Prepare success message
-                message = (
-                    "✅ Pipeline Update Successful\n\n"
-                    f"⏱️ Execution Time: {execution_time:.2f}s\n"
-                    f"🔄 Updated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                )
-            
-                logger.info(message)
-                notifier.send_message(message, result_df)
-            else:
-                message = (
-                    "✅ Pipeline Update Successful\n\n"
-                    f"⏱️ Execution Time: {execution_time:.2f}s\n"
-                    f"🔄 Updated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                    f"📊 Results: No extreme cases found"
-                )
-            
-                logger.info(message)
-                notifier.send_message(message)
+        logger.info(message)
+        notifier.send_message(message)
         
     except Exception as e:
         # Prepare error message
@@ -132,16 +116,26 @@ if __name__ == "__main__":
     # Create scheduler
     scheduler = BlockingScheduler()
     
-    # Add job to run every 5 minutes
-    scheduler.add_job(
+    now = datetime.now()
+    run_immediate = now.minute >= 58
+    next_run = now if run_immediate else now.replace(minute=58, second=0, microsecond=0)
+    
+    # Add job to run at minute 58 of every hour
+    job = scheduler.add_job(
         job, 
-        'interval', 
-        minutes=5,
-        next_run_time=datetime.now()  # Run immediately on start
+        'cron', 
+        minute='58',
+        next_run_time=next_run
     )
     
     try:
-        logger.info("Starting scheduler...")
+        next_time = job.next_run_time
+        if run_immediate:
+            logger.info(f"Starting scheduler... Running immediately at: {now.strftime('%Y-%m-%d %H:%M:%S')}")
+        else:
+            logger.info(f"Starting scheduler... Current time: {now.strftime('%Y-%m-%d %H:%M:%S')}")
+            logger.info(f"Next run scheduled for: {next_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):
         logger.info("Scheduler stopped")
