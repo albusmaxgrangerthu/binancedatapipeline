@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 from typing import Dict, List, Any, Callable, Optional, Union
+from enum import Enum
 
+from config import *
 from utils_clickhouse import *
 
 from binance.spot import Spot
@@ -20,31 +22,33 @@ import threading
 class BinanceDataFetcher:
     # Add class constants for rate limits
     SPOT_WEIGHT_LIMIT = 5500    # requests per minute for spot
-    SPOT_KLINE_WEIGHT = 2
+    SPOT_KLINE_WEIGHT = 2 # limit 1000
     FUTURES_WEIGHT_LIMIT = 2300 # requests per minute for futures
-    FUTURES_KLINE_WEIGHT = 2
+    FUTURES_KLINE_WEIGHT = 2 # limit 499
+    OPTIONS_WEIGHT_LIMIT = 2300 # requests per minute for options
+    OPTIONS_KLINE_WEIGHT = 1 # limit 1500
     RATE_LIMIT_PERIOD = 60    # seconds
 
     FR_LIMIT = 1000
-    FR_PERIOD = 300
+    FR_PERIOD = 60 * 5
 
     MR_LIMIT = 1000
     MR_PERIOD = 60
-    
-    BATCH_SIZE = 20          # symbols per batch
+
     FUTURES_MAX_WORKERS = 8
     SPOT_MAX_WORKERS = 10
+    OPTIONS_MAX_WORKERS = 3
 
-    SYMBOL_DELAY = 0.05       # 150ms between symbols
-    BATCH_DELAY = 0.5         # 500ms between batches
-    
-    
+    RATE_LIMIT_DELAY = 30         # 30 seconds 
+
+
     def __init__(self, con: Client, api_key: Optional[str] = None, api_secret: Optional[str] = None):
         """
         Initialize Binance data fetcher with optional API credentials
         """
         self.spot_client = Spot(api_key=api_key, api_secret=api_secret)
         self.um_futures_client = UMFutures(key=api_key, secret=api_secret)
+        self.options_client = BinanceOptionsClient(api_key=api_key, api_secret=api_secret)
         self.con = con
 
         # Setup logging
@@ -113,7 +117,7 @@ class BinanceDataFetcher:
         """
         try:
             exchange_info = self.um_futures_client.exchange_info()
-            perp_data = []
+            symbols_data = []
             
             for symbol in exchange_info['symbols']:
                 if symbol['contractType'] == 'PERPETUAL':
@@ -144,9 +148,9 @@ class BinanceDataFetcher:
                         'step_size': float(symbol['filters'][1]['stepSize'])
                         
                     }
-                    perp_data.append(symbol_info)
+                    symbols_data.append(symbol_info)
             
-            df = pd.DataFrame(perp_data)
+            df = pd.DataFrame(symbols_data)
             # the dates are both in UTC tz
             df['delivery_date'] = pd.to_datetime(df['delivery_date'], unit='ms')
             df['onboard_date'] = pd.to_datetime(df['onboard_date'], unit='ms')
@@ -162,6 +166,278 @@ class BinanceDataFetcher:
         wait=wait_exponential(multiplier=1, min=4, max=10),
         reraise=True
     )
+    def get_option_symbols(self) -> pd.DataFrame:
+        """
+        Fetch all available options trading pairs
+        Returns DataFrame with symbol details
+        """
+        try:
+            # Get all options symbols
+            exchange_info = self.options_client.get_exchange_info()
+            symbols_data = []
+            
+            for symbol in exchange_info['optionSymbols']:
+                # Flatten the filters dictionary
+                filters = symbol['filters']
+                price_filter = next(f for f in filters if f['filterType'] == 'PRICE_FILTER')
+                lot_filter = next(f for f in filters if f['filterType'] == 'LOT_SIZE')
+                
+                symbol_data = {
+                    'symbol': symbol['symbol'],
+                    'underlying': symbol['underlying'],
+                    'quoteAsset': symbol['quoteAsset'],
+                    'unit': symbol['unit'],
+                    'exchange': 'binance',
+                    'type': 'OPTION',
+                    'expiryDate': symbol['expiryDate'],
+                    'side': symbol['side'],                  
+                    'strikePrice': float(symbol['strikePrice']),
+                                 
+                    # Price filter info
+                    'minPrice': float(price_filter['minPrice']),
+                    'maxPrice': float(price_filter['maxPrice']),
+                    'tickSize': float(price_filter['tickSize']),
+                    'priceScale': symbol['priceScale'],
+                    # Lot size filter info
+                    'minQty': float(lot_filter['minQty']),
+                    'maxQty': float(lot_filter['maxQty']),
+                    'stepSize': float(lot_filter['stepSize']),
+                    'quantityScale': symbol['quantityScale'],
+                    # Fee rates
+                    'makerFeeRate': float(symbol['makerFeeRate']),
+                    'takerFeeRate': float(symbol['takerFeeRate']),
+                    'liquidationFeeRate': float(symbol['liquidationFeeRate']),
+                    # Margin requirements
+                    'initialMargin': float(symbol['initialMargin']),
+                    'maintenanceMargin': float(symbol['maintenanceMargin']),
+                    'minInitialMargin': float(symbol['minInitialMargin']),
+                    'minMaintenanceMargin': float(symbol['minMaintenanceMargin'])
+                }
+                symbols_data.append(symbol_data)     
+          
+            df = pd.DataFrame(symbols_data)
+            df['expiryDate'] = pd.to_datetime(df['expiryDate'], unit='ms')
+            self.logger.info(f"Fetched {len(df)} active options symbols")
+            return df
+
+        except Exception as e:
+            self.logger.error(f"Error fetching active options symbols: {e}")
+            raise
+    
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=4, max=10),
+        reraise=True
+    )
+    @sleep_and_retry
+    @limits(calls=390/OPTIONS_MAX_WORKERS, period=RATE_LIMIT_PERIOD)
+    def _rate_limited_exercise_history(self, underlying: str, **kwargs) -> List:
+        """Base rate-limited exercise history API call"""
+        try:
+            return self.options_client.get_exercise_history(underlying=underlying, **kwargs)
+        except Exception as e:
+            self._handle_rate_limit_error(e)
+            # Handle rate limits
+            if '418' in str(e):
+                return self._rate_limited_exercise_history(underlying, **kwargs)             
+            # Other errors
+            raise
+    
+    def get_option_exercise_history(self, 
+                             underlying: str,
+                             start_time: int = None,
+                             end_time: int = None,
+                             limit: int = 100) -> pd.DataFrame:
+        """
+        Fetch exercise history
+        (start_time, end_time)
+        """
+        try:
+            exercise_history = self._rate_limited_exercise_history(
+                underlying=underlying,
+                startTime=start_time,
+                endTime=end_time,
+                limit=limit
+            )
+            
+            if not exercise_history:
+                return pd.DataFrame()
+            
+            df = pd.DataFrame(exercise_history)
+            return df
+        except Exception as e:
+            self.logger.error(f"Error fetching option exercise history: {e}")
+            raise
+
+    def get_historical_option_exercise_history(self, 
+                                                 underlying: str,
+                                                 start_time: Union[str, datetime, int],
+                                                 end_time: Union[str, datetime, int],
+                                                 limit: int = 100) -> pd.DataFrame:
+        """Fetch historical options exercise history"""
+        try:
+            all_exercise_history = []
+            ts_col = 'expiryDate'
+            
+            if isinstance(start_time, (str, datetime)):
+                start_time_ms = int(pd.Timestamp(start_time).timestamp() * 1000) - 1
+            else:
+                start_time_ms = start_time - 1
+            if isinstance(end_time, (str, datetime)):
+                end_time_ms = int(pd.Timestamp(end_time).timestamp() * 1000) + 1 # ()
+            else:
+                end_time_ms = end_time + 1
+            
+            current_end_ms = end_time_ms
+            while current_end_ms > start_time_ms:              
+                df = self.get_option_exercise_history(
+                    underlying=underlying,
+                    start_time=start_time_ms,
+                    end_time=current_end_ms,
+                    limit=limit
+                )
+
+                self.logger.info(
+                    f"Fetched {len(df)} options exercise history for {underlying} "
+                    f"from {pd.to_datetime(start_time_ms, unit='ms')} to {pd.to_datetime(current_end_ms, unit='ms')}"
+                )
+                if not df.empty:
+                    all_exercise_history.append(df)
+                    
+                    if len(df) == limit:    # for a given underlying, the max symbols at one day < limit   
+                        if current_end_ms > int(df[ts_col].iloc[-1]) + 1:
+                            current_end_ms = int(df[ts_col].iloc[-1]) + 1
+                        else:
+                            current_end_ms = int(df[ts_col].iloc[-1])
+                    else:
+                        break
+                else:
+                    break              
+                
+            if all_exercise_history:
+                result = pd.concat(all_exercise_history, axis=0)
+                result = (result
+                        .drop_duplicates(subset=['symbol', ts_col], keep='first')
+                        .sort_values(['symbol', ts_col])
+                        .reset_index(drop=True))
+                
+                result['underlying'] = underlying
+                return result
+            
+            return pd.DataFrame()
+        
+        except Exception as e:
+            self.logger.error(f"Error fetching historical option exercise history: {e}")
+            raise
+
+    def fetch_market_option_exercise_history_threadpool(self,
+                                                        start_time: Union[str, datetime, int],
+                                                        end_time: Union[str, datetime, int],
+                                                        limit: int = 100) -> pd.DataFrame:
+        """Fetch historical options exercise history using thread pool"""
+        try:
+            # Get current active underlying
+            symbols_df = pd.DataFrame(self.options_client.get_exchange_info()['optionContracts'])
+            ts_col = 'expiryDate'
+
+            # Calculate optimal thread count based on rate limits
+            max_workers = self.OPTIONS_MAX_WORKERS  # Conservative
+
+            self.logger.info(
+                f"Fetching option exercise history for {len(symbols_df)} underlyings "
+                f"using {max_workers} threads"
+            )
+            
+            # Set default time range if not provided
+            if end_time is None:
+                end_time = datetime.now(timezone.utc)
+            if start_time is None:
+                start_time = datetime(2025, 1, 20)  
+            
+            # Shared result containers
+            all_results = []
+            failed_symbols = []
+            result_lock = threading.Lock()  
+            
+            def process_symbol(symbol):
+                """Thread worker function"""
+                try:
+                    exercise_history = self.get_historical_option_exercise_history(
+                        underlying=symbol,
+                        start_time=start_time,
+                        end_time=end_time,
+                        limit=limit
+                    )
+                    
+                    if not exercise_history.empty:
+                        with result_lock:
+                            all_results.append(exercise_history)
+                            self.logger.info(
+                                f"Fetched {len(exercise_history)} exercise history for {symbol} "
+                                f"from {pd.to_datetime(exercise_history[ts_col].min(), unit='ms')} to {pd.to_datetime(exercise_history[ts_col].max(), unit='ms')}"
+                            )
+                except Exception as e:
+                    if '418' in str(e):
+                        self._handle_rate_limit_error(e)
+                        return process_symbol(symbol)
+                    with result_lock:
+                        failed_symbols.append(symbol)
+                        self.logger.error(f"Error fetching {symbol}: {e}")
+
+            # Process symbols using thread pool
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = []
+
+                # Submit all symbols to thread pool
+                for _, row in symbols_df.iterrows():
+                    symbol = row['underlying']
+                    futures.append(
+                        executor.submit(process_symbol, symbol)
+                    )
+                
+                # Show progress bar while waiting for completion    
+                with tqdm(total=len(futures), desc="Fetching options exercise history") as pbar:
+                    for future in futures:
+                        future.result()  # Wait for completion
+                        pbar.update(1)
+
+            # Report failed symbols and process final results
+            if failed_symbols:
+                self.logger.warning(
+                    f"Failed to fetch data for {len(failed_symbols)} symbols: {failed_symbols}"
+                )
+
+            if all_results:
+                result = pd.concat(all_results, axis=0)
+                result = (result
+                        .drop_duplicates(subset=['symbol'], keep='last')
+                        .sort_values(['symbol'])
+                        .reset_index(drop=True))
+                
+                result[ts_col] = pd.to_datetime(result[ts_col], unit='ms')
+                
+                numeric_cols = ['strikePrice', 'realStrikePrice']
+                result[numeric_cols] = result[numeric_cols].astype(float)
+                
+                result['exchange'] = 'binance'
+                result['type'] = 'OPTION'
+
+                columns = ['symbol', 'exchange', 'type', 'underlying', ts_col, 
+                           'strikePrice', 'realStrikePrice', 'strikeResult']
+                return result[columns]
+            
+            return pd.DataFrame()
+        
+        except Exception as e:
+            self.logger.error(f"Error in fetch_market_option_exercise_history_threadpool: {e}")
+            raise
+    
+    
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=4, max=10),
+        reraise=True
+    )
     @sleep_and_retry
     @limits(calls=MR_LIMIT, period=MR_PERIOD)
     def _rate_limited_margin_interest_rates(self, asset: str, **kwargs) -> List:
@@ -170,7 +446,7 @@ class BinanceDataFetcher:
             return self.spot_client.margin_interest_rate_history(asset=asset, **kwargs)
         except Exception as e:
             # Handle specific error codes first
-            if '-11027' in str(e):  # Asset not supported
+            if '-1102' in str(e):  # Asset not supported
                 self.logger.info(f"Asset {asset} not supported for margin interest rate")
                 return []
             
@@ -236,8 +512,12 @@ class BinanceDataFetcher:
             # Convert times to milliseconds timestamp
             if isinstance(start_time, (str, datetime)):
                 start_time_ms = int(pd.Timestamp(start_time).timestamp() * 1000)
+            else:
+                start_time_ms = start_time
             if isinstance(end_time, (str, datetime)):
                 end_time_ms = int(pd.Timestamp(end_time).timestamp() * 1000)
+            else:
+                end_time_ms = end_time
 
             if list_date and isinstance(list_date, (str, datetime)):
                 list_date_ms = int(pd.Timestamp(list_date).timestamp() * 1000)
@@ -483,13 +763,17 @@ class BinanceDataFetcher:
         """
         try:
             all_funding_rates = []
-            current_start = start_time
             
             # Convert times to milliseconds timestamp
             if isinstance(start_time, (str, datetime)):
-                current_start = int(pd.Timestamp(start_time).timestamp() * 1000)
+                start_time_ms = int(pd.Timestamp(start_time).timestamp() * 1000)
+            else:
+                start_time_ms = start_time
+            
             if isinstance(end_time, (str, datetime)):
-                end_time = int(pd.Timestamp(end_time).timestamp() * 1000)
+                end_time_ms = int(pd.Timestamp(end_time).timestamp() * 1000)
+            else:
+                end_time_ms = end_time
                 
             # Get and check delivery date
             #with connect_duckdb(self.db_path) as con:
@@ -500,18 +784,15 @@ class BinanceDataFetcher:
                 delivery_date_ms = int(pd.Timestamp(delivery_date).timestamp() * 1000)
                 
                 # Compare millisecond timestamps directly
-                if delivery_date_ms < end_time:
-                    end_time = delivery_date_ms
+                end_time_ms = min(end_time_ms, delivery_date_ms)
             
-            while True:
-                if current_start > end_time:
-                    break
-                
+            current_start_ms = start_time_ms
+            while current_start_ms <= end_time_ms:              
                 # time.sleep(self.PAGINATION_DELAY)
                 df = self.get_funding_rate(
                     symbol=symbol,
-                    start_time=current_start,
-                    end_time=end_time,
+                    start_time=current_start_ms,
+                    end_time=end_time_ms,
                     limit=limit
                 )
                 
@@ -522,7 +803,7 @@ class BinanceDataFetcher:
                 
                 # Update start_time for next request
                 #current_start = int(df['fundingTime'].iloc[-1].timestamp() * 1000 + 1)
-                current_start = int(df['fundingTime'].iloc[-1]) + 1
+                current_start_ms = int(df['fundingTime'].iloc[-1]) + 1
             
             if all_funding_rates:
                 result = pd.concat(all_funding_rates, axis=0)
@@ -539,124 +820,17 @@ class BinanceDataFetcher:
         except Exception as e:
             self.logger.error(f"Error fetching historical funding rate data for {symbol}: {e}")
             raise
-    
-    def fetch_market_funding_rates(self,
-                                start_time: Union[str, datetime, int],
-                                end_time: Union[str, datetime, int],
-                                batch_size: int = None) -> pd.DataFrame:
-        """Fetch funding rates with batching and rate limiting"""
-        try:
-            # Get current perpetual symbols
-
-            symbols_df = clickhouse_query(self.con, f'''
-                    select symbol, delivery_date 
-                    from bn_perp_symbols 
-                    where delivery_date is not null''')
-            
-            # Force reasonable batch size
-            batch_size = batch_size or self.BATCH_SIZE
-            num_batches = math.ceil(len(symbols_df) / batch_size)
-            
-            self.logger.info(
-                f"Fetching funding rates for {len(symbols_df)} perpetual symbols "
-                f"in {num_batches} batches"
-            )
-
-            # Time range setting
-            if end_time is None:
-                end_time = datetime.now(timezone.utc)
-            if start_time is None:
-                start_time = datetime(2024, 1, 20)
-
-            # Process in batches
-            all_rates = []
-            with tqdm(total=len(symbols_df), desc="Fetching funding rates") as pbar:
-                for i in range(0, len(symbols_df), batch_size):
-                    batch_symbols = symbols_df.iloc[i:i + batch_size, 0]
-                    batch_delivery_dates = symbols_df.iloc[i:i + batch_size, 1]
-                    batch_rates = []
-                    
-                    for symbol, delivery_date in zip(batch_symbols, batch_delivery_dates):
-                        try:
-                            # Add delay between symbols
-                            #time.sleep(self.SYMBOL_DELAY)  # 150ms delay
-                            
-                            rates = self.get_historical_funding_rate(
-                                symbol=symbol,
-                                start_time=start_time,
-                                end_time=end_time,
-                                delivery_date=delivery_date
-                            )
-                            
-                            if rates is not None and not rates.empty:
-                                batch_rates.append(rates)
-                                self.logger.info(
-                                    f"Fetched {len(rates)} funding rates for {symbol} "
-                                    f"from {pd.to_datetime(rates['fundingTime'].min(), unit='ms')} to {pd.to_datetime(rates['fundingTime'].max(), unit='ms')}"
-                                )
-                        
-                        except Exception as e:
-                            self.logger.error(f"Error fetching funding rates for {symbol}: {e}")
-                        finally:
-                            pbar.update(1)
-                    
-                    if batch_rates:
-                        # Process batch results
-                        batch_result = pd.concat(batch_rates, axis=0)
-                        batch_result = (batch_result
-                                    .drop_duplicates(subset=['symbol', 'fundingTime'], keep='last')
-                                    .sort_values(['symbol', 'fundingTime'])
-                                    )                                   
-
-                        all_rates.append(batch_result)
-                    
-                    # Clear memory
-                    del batch_rates
-                    if 'batch_result' in locals():
-                        del batch_result
-                    
-                    # Add delay between batches
-                    #time.sleep(self.BATCH_DELAY)  # 500ms delay
-            
-            if all_rates:
-                # Final concatenation and cleanup
-                result = pd.concat(all_rates, axis=0)
-                result = (result
-                        .drop_duplicates(subset=['symbol', 'fundingTime'], keep='last')
-                        .sort_values(['symbol', 'fundingTime'])
-                        .reset_index(drop=True))
-                
-                self.logger.info(
-                    f"Successfully fetched {len(result)} funding rates "
-                    f"for {len(result['symbol'].unique())} symbols"
-                )
-
-                if not result.empty:
-                    result['fundingTime'] = pd.to_datetime(result['fundingTime'], unit='ms')
-                    result[['fundingRate', 'markPrice']] = result[['fundingRate', 'markPrice']].astype(float)
-                    result['exchange'] = 'binance'
-                    result['type'] = 'PERPETUAL'
-                    
-                    # Reorder columns
-                    columns = ['symbol', 'exchange', 'type', 'fundingTime', 'fundingRate', 'markPrice']
-                    return result[columns]
-                
-            return pd.DataFrame()
-
-        except Exception as e:
-            self.logger.error(f"Error in fetch_market_funding_rates: {e}")
-            raise
-    
+        
     def fetch_market_funding_rates_threadpool(self,
                                 start_time: Union[str, datetime, int],
                                 end_time: Union[str, datetime, int]) -> pd.DataFrame:
         """Fetch funding rates using thread pool"""
         try:
             # Get current perpetual symbols
-            symbols_df = clickhouse_query(self.con, '''
+            symbols_df = clickhouse_query(self.con, f'''
                     select symbol, delivery_date 
                     from bn_perp_symbols 
-                    where delivery_date is not null
+                    where delivery_date >= '{pd.Timestamp(start_time)}'
             ''')
 
             # Calculate optimal thread count based on rate limit
@@ -847,28 +1021,51 @@ class BinanceDataFetcher:
                 return self._rate_limited_futures_klines(symbol, **kwargs)
             raise
     
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=4, max=10),
+        reraise=True
+    )
+    @sleep_and_retry
+    @limits(calls=390, period=RATE_LIMIT_PERIOD)  # Conservative futures limit
+    def _rate_limited_options_klines(self, symbol: str, **kwargs) -> List:
+        """Rate-limited futures API call"""
+        try:
+            return self.options_client.get_klines(symbol=symbol, **kwargs)
+        except Exception as e:
+            self._handle_rate_limit_error(e)
+            # After waiting for IP ban, retry the request
+            if '418' in str(e):
+                return self._rate_limited_options_klines(symbol, **kwargs)
+            raise
+    
     def get_klines(self, 
                    symbol: str,
+                   type: str,
                    start_time: int = None,
                    end_time: int = None,
                    interval: str = '1m',
-                   limit: int = 1000,
-                   is_futures: bool = False) -> pd.DataFrame:
+                   limit: int = 1000) -> pd.DataFrame:
         """
         Fetch kline/candlestick data for spot or futures
         
         Parameters:
         - symbol: Trading pair symbol
+        - type: 'PERPETUAL' or 'SPOT' or 'OPTION'
         - start_time: Start time for historical data; UTC default; [
         - end_time: End time for historical data; UTC default; ]
         - interval: Kline interval ('1m' for 1-minute)
         - limit: Number of records to fetch (max 1000)
-        - is_futures: Whether to fetch futures data
         """
         try:
-            #client = self.um_futures_client if is_futures else self.spot_client
-            api_call = (self._rate_limited_futures_klines if is_futures 
-                        else self._rate_limited_spot_klines)
+            if type == 'PERPETUAL':
+                api_call = self._rate_limited_futures_klines
+            elif type == 'SPOT':
+                api_call = self._rate_limited_spot_klines
+            elif type == 'OPTION':
+                api_call = self._rate_limited_options_klines
+            else:
+                raise ValueError(f"Invalid type: {type}")
             
             klines = api_call(
                 symbol=symbol,
@@ -882,12 +1079,17 @@ class BinanceDataFetcher:
                 return pd.DataFrame()
             
             # Convert to DataFrame
-            df = pd.DataFrame(klines, columns=[
-                'timestamp', 'open', 'high', 'low', 'close', 
-                'volume', 'close_time', 'quote_volume', 'trades_count',
-                'taker_buy_volume', 'taker_buy_quote_volume', 'ignore'
-            ])         
-            
+            if type in ['PERPETUAL', 'SPOT']:
+                df = pd.DataFrame(klines, columns=[
+                    'timestamp', 'open', 'high', 'low', 'close', 
+                    'volume', 'close_time', 'quote_volume', 'trades_count',
+                    'taker_buy_volume', 'taker_buy_quote_volume', 'ignore'
+                ])         
+            elif type in ['OPTION']:
+                df = pd.DataFrame(klines)
+                df.columns = ['open', 'high', 'low', 'close', 'volume', 'interval', 'trades_count', 
+             'taker_buy_volume', 'taker_buy_quote_volume', 'quote_volume', 'timestamp', 'close_time']    
+
             return df
             
         except Exception as e:
@@ -896,27 +1098,31 @@ class BinanceDataFetcher:
     
     def get_historical_klines(self,
                             symbol: str,
+                            type: str,
                             start_time: Union[str, datetime, int],
                             end_time: Union[str, datetime, int],
                             delivery_date: Union[str, datetime, int] = '2100-12-25 08:00:00',
-                            interval: str = '1m',
-                            is_futures: bool = False) -> pd.DataFrame:
+                            interval: str = '1m') -> pd.DataFrame:
         """
         Fetch historical kline data by making multiple requests if needed
         Handles rate limiting and pagination
         """
         try:
             all_klines = []
-            current_start = start_time
             
             # Convert times to milliseconds timestamp
             if isinstance(start_time, (str, datetime)):
-                current_start = int(pd.Timestamp(start_time).timestamp() * 1000)
+                start_time_ms = int(pd.Timestamp(start_time).timestamp() * 1000)
+            else:
+                start_time_ms = start_time
+
             if isinstance(end_time, (str, datetime)):
-                end_time = int(pd.Timestamp(end_time).timestamp() * 1000)
+                end_time_ms = int(pd.Timestamp(end_time).timestamp() * 1000)
+            else:
+                end_time_ms = end_time
                 
             # Check delivery date for futures
-            if is_futures and delivery_date and isinstance(delivery_date, (str, datetime)):
+            if type in ['PERPETUAL', 'OPTION'] and delivery_date and isinstance(delivery_date, (str, datetime)):
                 # get delivery datetime utc; end_time is utc; compare
                 #with connect_duckdb(self.db_path) as con:
                     # 取出来就直接是 tz naive; 但实质是 UTC
@@ -926,39 +1132,62 @@ class BinanceDataFetcher:
                 delivery_date_ms = int(pd.Timestamp(delivery_date).timestamp() * 1000)
                 
                 # Compare millisecond timestamps directly
-                if delivery_date_ms < end_time:
-                    end_time = delivery_date_ms
+                end_time_ms = min(end_time_ms, delivery_date_ms)
             
-            while True:
-                if current_start > end_time:
-                    break
-                
-                df = self.get_klines(
-                    symbol=symbol,
-                    start_time=current_start,
-                    end_time=end_time,
-                    interval=interval,
-                    limit=499 if is_futures else 1000,  # limit parameter ---- rate limit
-                    is_futures=is_futures
-                )
-                
-                if df is None or df.empty:
-                    break
+            if type in ['PERPETUAL', 'SPOT']:
+                current_start_ms = start_time_ms
+                while end_time_ms >= current_start_ms: # []                
+                    df = self.get_klines(
+                        symbol=symbol,
+                        type=type,
+                        start_time=current_start_ms,
+                        end_time=end_time_ms,
+                        interval=interval,
+                        limit=499 if type in ['PERPETUAL'] else 1000,  # limit parameter ---- rate limit                 
+                    )
                     
-                all_klines.append(df)
-                
-                # Update start_time for next request
-                current_start = int(df['timestamp'].iloc[-1]) + 1
+                    if df is None or df.empty:
+                        break
+                        
+                    all_klines.append(df)
+                    
+                    # Update start_time for next request
+                    current_start_ms = int(df['timestamp'].iloc[-1]) + 1
+            
+            elif type in ['OPTION']:
+                current_end_ms = end_time_ms
+                while current_end_ms >= start_time_ms: # []               
+                    df = self.get_klines(
+                        symbol=symbol,
+                        type=type,
+                        start_time=start_time_ms,
+                        end_time=current_end_ms,
+                        interval=interval,
+                        limit=499  # limit parameter ---- rate limit                     
+                    )
+                    
+                    if df is None or df.empty:
+                        break
+
+                    all_klines.append(df)
+                    
+                    # Update start_time for next request
+                    current_end_ms = int(df['timestamp'].iloc[-1]) - 1
+                        
             
             if all_klines:
                 result = pd.concat(all_klines, axis=0)
                 
+                if type in ['PERPETUAL', 'SPOT']:
+                    result = result.drop_duplicates(subset=['timestamp'], keep='last')
+
+                elif type in ['OPTION']:
+                    result = result.drop_duplicates(subset=['timestamp'], keep='first')
+
                 result = (result
-                        .drop_duplicates(subset=['timestamp'], keep='last')
                         .sort_values(['timestamp'])
                         .reset_index(drop=True)
                         )
-                
                 result['symbol'] = symbol
                 return result
             
@@ -968,176 +1197,42 @@ class BinanceDataFetcher:
             self.logger.error(f"Error fetching historical kline data for {symbol}: {e}")
             raise
     
-    def fetch_market_klines(self,
-                        start_time: Union[str, datetime, int],
-                        end_time: Union[str, datetime, int],
-                        interval: str = '1m',
-                        is_futures: bool = False,
-                        batch_size: int = None) -> pd.DataFrame:
-        """
-        Fetch historical kline data for all symbols with batching and rate limiting
-        """
-        try:
-            # Get current active symbols
-            if is_futures:
-                symbols_df = clickhouse_query(self.con, f'''
-                        select symbol, delivery_date 
-                        from bn_perp_symbols 
-                        where delivery_date is not null
-                ''')
-            else:
-                symbols_df = clickhouse_query(self.con, f'''
-                        select symbol 
-                        from bn_spot_symbols 
-                        where quote_asset in ('USDT') 
-                ''')
-            
-            batch_size = batch_size or self.BATCH_SIZE
-            num_batches = math.ceil(len(symbols_df) / batch_size)
-            
-            self.logger.info(
-                f"Fetching {interval} klines for {len(symbols_df)} "
-                f"{'perpetual' if is_futures else 'spot'} symbols in {num_batches} batches"
-            )
-
-            # Set default time range if not provided
-            if end_time is None:
-                end_time = datetime.now(timezone.utc)
-            if start_time is None:
-                start_time = datetime(2025, 1, 20)
-
-            # Process symbols in batches
-            all_results = []
-            failed_symbols = []
-            with tqdm(total=len(symbols_df), desc="Fetching klines") as pbar:
-                for i in range(0, len(symbols_df), batch_size):
-                    try:
-                        batch_symbols = symbols_df.iloc[i:i + batch_size, 0]
-                        batch_delivery_dates = symbols_df.iloc[i:i + batch_size, 1] if is_futures else [None] * batch_size
-                        batch_klines = []
-                        
-                        # Process each symbol in the batch
-                        for symbol, delivery_date in zip(batch_symbols, batch_delivery_dates):
-                            try:
-                                # Add delay between symbols within batch
-                                #time.sleep(self.SYMBOL_DELAY)  # 50ms delay between symbols
-                                
-                                klines = self.get_historical_klines(
-                                    symbol=symbol,
-                                    start_time=start_time,
-                                    end_time=end_time,
-                                    delivery_date=delivery_date,
-                                    interval=interval,
-                                    is_futures=is_futures
-                                )
-                                
-                                if klines is not None and not klines.empty:
-                                    batch_klines.append(klines)
-                                    self.logger.info(
-                                        f"Fetched {len(klines)} klines for {symbol} "
-                                        f"from {klines['timestamp'].min()} to {klines['timestamp'].max()}"
-                                    )
-                            
-                            except Exception as e:
-                                if '418' in str(e):
-                                    self._handle_rate_limit_error(e)
-                                    i -= batch_size  # Retries the entire batch
-                                    break
-                                failed_symbols.append(symbol)
-                                self.logger.error(f"Error fetching {symbol}: {e}")
-                            finally:
-                                pbar.update(1)
-                        
-                        if batch_klines:
-                            # Process batch results
-                            batch_result = pd.concat(batch_klines, axis=0)
-                            batch_result = (batch_result
-                                        .drop_duplicates(subset=['symbol', 'timestamp'], keep='last')
-                                        .sort_values(['symbol', 'timestamp']))
-                            all_results.append(batch_result)
-                        
-                        # Clear memory
-                        del batch_klines
-                        if 'batch_result' in locals():
-                            del batch_result
-                        
-                        # Add delay between batches
-                        #time.sleep(self.BATCH_DELAY)  # 500ms delay between batches
-                    
-                    except Exception as e:
-                        self.logger.error(f"Error processing batch: {e}")
-                        time.sleep(5)
-
-            # Report failed symbols
-            if failed_symbols:
-                self.logger.warning(f"Failed to fetch data for {len(failed_symbols)} symbols: {failed_symbols}")
-            
-            if all_results:
-                # Final concatenation and cleanup
-                result = pd.concat(all_results, axis=0)
-                result = (result
-                        .sort_values(['symbol', 'timestamp'])
-                        .drop_duplicates(subset=['symbol', 'timestamp'], keep='last')                      
-                        .reset_index(drop=True))
-                
-                self.logger.info(
-                        f"Successfully fetched {len(result)} klines "
-                        f"for {len(result['symbol'].unique())} symbols"
-                )
-
-                if not result.empty:
-                    # Convert types
-                    result['timestamp'] = pd.to_datetime(result['timestamp'], unit='ms')
-                    result['close_time'] = pd.to_datetime(result['close_time'], unit='ms')
-                    
-                    numeric_cols = ['open', 'high', 'low', 'close', 'volume', 
-                                    'quote_volume', 'taker_buy_volume', 'taker_buy_quote_volume', 'ignore']
-                    result[numeric_cols] = result[numeric_cols].astype(float)
-                    
-                    
-                    result['exchange'] = 'binance'
-                    result['type'] = 'SPOT' if not is_futures else 'PERPETUAL'
-                    result['interval'] = interval
-                
-                    columns = ['symbol', 'exchange', 'type', 'interval', 'timestamp', 'close_time', 
-                               'open', 'high', 'low', 'close', 'volume', 'quote_volume', 'taker_buy_volume', 'taker_buy_quote_volume', 'trades_count', 'ignore']
-                    return result[columns]
-                                   
-            return pd.DataFrame()
-
-        except Exception as e:
-            self.logger.error(f"Error in fetch_market_klines: {e}")
-            raise 
-
     def fetch_market_klines_threadpool(self,
+                        type: str,
                         start_time: Union[str, datetime, int],
                         end_time: Union[str, datetime, int],
-                        interval: str = '1m',
-                        is_futures: bool = False) -> pd.DataFrame:
+                        interval: str = '1m') -> pd.DataFrame:
         """Fetch historical kline data using thread pool"""
         try:
             # Get current active symbols
-            if is_futures:
+            if type in ['PERPETUAL']:
                 symbols_df = clickhouse_query(self.con, 
-                        '''select symbol, delivery_date 
+                        f'''select symbol, delivery_date 
                         from bn_perp_symbols 
-                        where delivery_date is not null ''')
-            else:
+                        where delivery_date >= '{pd.Timestamp(start_time)}' ''')
+            elif type in ['SPOT']:
                 symbols_df = clickhouse_query(self.con, 
-                        '''select symbol 
-                        from bn_spot_symbols 
-                        where quote_asset in ('USDT') ''')
+                        '''select symbol from bn_spot_symbols 
+                        where quote_asset in ('USDT','USDC') ''')
+            elif type in ['OPTION']:
+                symbols_df = clickhouse_query(self.con, 
+                        f'''select symbol, expiryDate 
+                        from bn_option_symbols_active
+                        where expiryDate >= '{pd.Timestamp(start_time)}' ''')
 
             # Calculate optimal thread count based on rate limits
-            if is_futures:
+            if type in ['PERPETUAL']:
                 # For futures with limit=1000: 2400/5 = 480 requests/min
                 max_workers = self.FUTURES_MAX_WORKERS  # Conservative
-            else:
+            elif type in ['OPTION']:
+                max_workers = self.OPTIONS_MAX_WORKERS    
+            elif type in ['SPOT']:
                 max_workers = self.SPOT_MAX_WORKERS  # Spot has higher limit
+            
 
             self.logger.info(
                 f"Fetching {interval} klines for {len(symbols_df)} "
-                f"{'perpetual' if is_futures else 'spot'} symbols using {max_workers} threads"
+                f"{type} symbols using {max_workers} threads"
             )
 
             # Set default time range if not provided
@@ -1156,11 +1251,11 @@ class BinanceDataFetcher:
                 try:
                     klines = self.get_historical_klines(
                         symbol=symbol,
+                        type=type,
                         start_time=start_time,
                         end_time=end_time,
                         delivery_date=delivery_date,
-                        interval=interval,
-                        is_futures=is_futures
+                        interval=interval
                     )
                     
                     if klines is not None and not klines.empty:
@@ -1187,7 +1282,12 @@ class BinanceDataFetcher:
                 # Submit all symbols to thread pool
                 for _, row in symbols_df.iterrows():
                     symbol = row['symbol']
-                    delivery_date = row['delivery_date'] if is_futures else None
+                    if type in ['PERPETUAL']:
+                        delivery_date = row['delivery_date']
+                    elif type in ['SPOT']:
+                        delivery_date = None
+                    elif type in ['OPTION']:
+                        delivery_date = row['expiryDate']
                     futures.append(
                         executor.submit(process_symbol, symbol, delivery_date)
                     )
@@ -1219,17 +1319,17 @@ class BinanceDataFetcher:
                     
                     numeric_cols = ['open', 'high', 'low', 'close', 'volume', 
                                 'quote_volume', 'taker_buy_volume', 
-                                'taker_buy_quote_volume', 'ignore']
+                                'taker_buy_quote_volume']
                     result[numeric_cols] = result[numeric_cols].astype(float)
                     
                     result['exchange'] = 'binance'
-                    result['type'] = 'SPOT' if not is_futures else 'PERPETUAL'
+                    result['type'] = type
                     result['interval'] = interval
 
                     columns = ['symbol', 'exchange', 'type', 'interval', 'timestamp', 
                             'close_time', 'open', 'high', 'low', 'close', 'volume', 
                             'quote_volume', 'taker_buy_volume', 'taker_buy_quote_volume', 
-                            'trades_count', 'ignore']
+                            'trades_count']
                     return result[columns]
 
             return pd.DataFrame()
@@ -1299,7 +1399,7 @@ class TableConfig:
     needs_incremental: bool = True               # Whether table needs incremental updates
 
 
-def create_crypto_data_pipeline(con: Client, klines_interval: str = '1h') -> Dict[str, TableConfig]:
+def create_crypto_data_pipeline(con: Client) -> Dict[str, TableConfig]:
     """Create configurations for different crypto market data tables"""
     
     # Define table configurations
@@ -1362,6 +1462,71 @@ def create_crypto_data_pipeline(con: Client, klines_interval: str = '1h') -> Dic
             needs_incremental=False
         ),
         
+        # Binance Options Symbols: Active
+        'bn_option_symbols_active': TableConfig(
+            name='bn_option_symbols_active',
+            primary_keys=['symbol', 'exchange'],
+            columns={
+                'symbol': 'String',
+                'underlying': 'String',
+                'quoteAsset': 'String',
+                'unit': 'Int32',
+                'exchange': 'String',
+                'type': 'String',
+                'expiryDate': 'DateTime',
+                'strikePrice': 'Float64',
+                'side': 'String',                  
+                # Price filter info
+                'minPrice': 'Float64',
+                'maxPrice': 'Float64',
+                'tickSize': 'Float64',
+                'priceScale': 'Int32',
+                # Lot size filter info
+                'minQty': 'Float64',
+                'maxQty': 'Float64',
+                'stepSize': 'Float64',
+                'quantityScale': 'Int32',
+                # Fee rates
+                'makerFeeRate': 'Float64',
+                'takerFeeRate': 'Float64',
+                'liquidationFeeRate': 'Float64',
+                # Margin requirements
+                'initialMargin': 'Float64',
+                'maintenanceMargin': 'Float64',
+                'minInitialMargin': 'Float64',
+                'minMaintenanceMargin': 'Float64'            
+            },
+            fetch_func=lambda fetcher: fetcher.get_option_symbols(),
+            fetch_args={},
+            update_frequency='daily',
+            needs_incremental=False
+        ),
+
+        # Binance Options Symbols: Excercised
+        'bn_option_symbols_exercised': TableConfig(
+            name='bn_option_symbols_exercised',
+            primary_keys=['symbol', 'exchange'],
+            columns={
+                'symbol': 'String',
+                'exchange': 'String',
+                'type': 'String',
+                'underlying': 'String',
+                'expiryDate': 'DateTime',
+                'strikePrice': 'Float64',
+                'realStrikePrice': 'Float64',
+                'strikeResult': 'String',
+            },
+            fetch_func=lambda fetcher, start_time, end_time: 
+                fetcher.fetch_market_option_exercise_history_threadpool(
+                    start_time=start_time,
+                    end_time=end_time,
+                    limit=100
+                ),
+            fetch_args={},
+            update_frequency='daily',
+            needs_incremental=True
+        ),
+
         # Binance Spot Klines
         'bn_spot_klines': TableConfig(
             name='bn_spot_klines',
@@ -1385,10 +1550,10 @@ def create_crypto_data_pipeline(con: Client, klines_interval: str = '1h') -> Dic
             },
             fetch_func=lambda fetcher, start_time, end_time: 
                 fetcher.fetch_market_klines_threadpool(
+                    type='SPOT',
                     start_time=start_time,
                     end_time=end_time,
-                    interval=klines_interval,
-                    is_futures=False
+                    interval=klines_interval
                 ),
             fetch_args={},
             update_frequency=klines_interval,
@@ -1418,10 +1583,43 @@ def create_crypto_data_pipeline(con: Client, klines_interval: str = '1h') -> Dic
             },
             fetch_func=lambda fetcher, start_time, end_time: 
                 fetcher.fetch_market_klines_threadpool(
+                    type='PERPETUAL',
                     start_time=start_time,
                     end_time=end_time,
-                    interval=klines_interval,
-                    is_futures=True
+                    interval=klines_interval
+                ),
+            fetch_args={},
+            update_frequency=klines_interval,
+            needs_incremental=True
+        ),
+
+        # Binance Option Klines
+        'bn_option_klines': TableConfig(
+            name='bn_option_klines',
+            primary_keys=['symbol', 'exchange', 'interval', 'timestamp'],
+            columns={
+                'symbol': 'String',
+                'exchange': 'String',
+                'type': 'String',
+                'interval': 'String',
+                'timestamp': 'DateTime',
+                'close_time': 'DateTime',
+                'open': 'Float64',
+                'high': 'Float64',
+                'low': 'Float64',
+                'close': 'Float64',
+                'volume': 'Float64',
+                'quote_volume': 'Float64',
+                'taker_buy_volume': 'Float64',
+                'taker_buy_quote_volume': 'Float64',
+                'trades_count': 'Int32'
+            },
+            fetch_func=lambda fetcher, start_time, end_time: 
+                fetcher.fetch_market_klines_threadpool(
+                    type='OPTION',
+                    start_time=start_time,
+                    end_time=end_time,
+                    interval=klines_interval                   
                 ),
             fetch_args={},
             update_frequency=klines_interval,
@@ -1491,7 +1689,7 @@ def create_crypto_data_pipeline(con: Client, klines_interval: str = '1h') -> Dic
                     vip_level=0
                 ),
             fetch_args={},
-            update_frequency='2h',
+            update_frequency='1h',
             needs_incremental=True
         )
     }
@@ -1499,11 +1697,10 @@ def create_crypto_data_pipeline(con: Client, klines_interval: str = '1h') -> Dic
     return table_configs
 
 class CryptoDataPipeline:
-    def __init__(self, con: Client, klines_interval: str = '1h', bn_api_key: str = None, bn_api_secret: str = None):
+    def __init__(self, con: Client, bn_api_key: str = None, bn_api_secret: str = None):
         self.con = con
-        self.klines_interval = klines_interval
         self.fetcher = BinanceDataFetcher(con, api_key=bn_api_key, api_secret=bn_api_secret)
-        self.table_configs = create_crypto_data_pipeline(con, klines_interval)
+        self.table_configs = create_crypto_data_pipeline(con)
         
         # Setup logging
         logging.basicConfig(level=logging.INFO)
@@ -1538,7 +1735,7 @@ class CryptoDataPipeline:
         """Get the latest timestamp in a table"""
         try:
             # Find the appropriate time column
-            time_col = next((col for col in ['timestamp', 'fundingTime'] 
+            time_col = next((col for col in ['timestamp', 'fundingTime', 'expiryDate'] 
                             if col in config.columns), None)
             
             if not time_col:
@@ -1547,7 +1744,7 @@ class CryptoDataPipeline:
             
             result = self.con.execute(f"SELECT MAX({time_col}) FROM {config.name}")[0][0]
             #print(result)
-            if result:
+            if result and int(pd.Timestamp(result).timestamp()) > 28800:
                 # UTC
                 return pd.Timestamp(result) #.tz_localize('Asia/Shanghai').tz_convert('UTC')
             else:
@@ -1577,7 +1774,7 @@ class CryptoDataPipeline:
             for col in bool_columns:
                 if col in new_df.columns:
                     # Explicitly convert to int using numpy
-                    new_df.loc[:, col] = np.where(new_df[col], 1, 0).astype(np.uint8)
+                    new_df[col] = new_df[col].astype(bool).astype(np.uint8)
             
             # Insert new data (ReplacingMergeTree will handle duplicates)
             self.con.insert_dataframe(
@@ -1621,10 +1818,10 @@ class CryptoDataPipeline:
                     latest_time = self.get_latest_update(config) # tz naive; UTC
                     if latest_time:
                         # Add a small buffer to avoid gaps
-                        if config.update_frequency == '1h':
-                            start_time = latest_time - timedelta(hours=2)
-                        elif config.update_frequency == '2h':
+                        if config.name in ['bn_funding_rates', 'bn_margin_interest_rates', 'bn_option_symbols_exercised']:
                             start_time = latest_time - timedelta(hours=8)
+                        elif config.update_frequency == klines_interval:
+                            start_time = latest_time - timedelta(hours=2)
                     else:
                         # If no data exists, use a default start time
                         start_time = pd.Timestamp(datetime(2020, 1, 1)) 
@@ -1664,7 +1861,7 @@ class CryptoDataPipeline:
 
     def update_all(self, start_time: Optional[datetime] = None, end_time: Optional[datetime] = None):
         """Update all tables in the pipeline"""
-        for table_name in ['bn_perp_symbols','bn_spot_symbols']:
+        for table_name in symbols_table_list:
             try:
                 print(f"\nUpdating {table_name}...")
                 self.update_market_data(self.table_configs[table_name], start_time, end_time)
@@ -1675,7 +1872,7 @@ class CryptoDataPipeline:
         if end_time is None:
             end_time = pd.Timestamp.now(tz='UTC').tz_localize(None)
 
-        for table_name in ['bn_perp_klines','bn_spot_klines']:
+        for table_name in klines_table_list:
             try:
                 print(f"\nUpdating {table_name}...")
                 self.update_market_data(self.table_configs[table_name], start_time, end_time)
@@ -1683,7 +1880,8 @@ class CryptoDataPipeline:
                 print(f"Failed to update {table_name}: {e}")
                 continue
         
-        for table_name in ['bn_funding_rates']:
+        #time.sleep(self.fetcher.RATE_LIMIT_DELAY)
+        for table_name in ['bn_option_klines']:
             try:
                 print(f"\nUpdating {table_name}...")
                 self.update_market_data(self.table_configs[table_name], start_time, end_time)
@@ -1720,8 +1918,8 @@ class CryptoDataPipeline:
                 continue
     
     def validate_data(self):
-        for type in ['perp', 'spot']:
-            print(f"\nValidating {type} klines data...")
+        for table_name, interval in zip(['bn_perp_klines', 'bn_spot_klines', 'bn_option_klines'], [1, 1, 1]):
+            print(f"\n---- Validating {table_name} data ----")
             gaps_query = f'''
             WITH time_diffs AS (
                 SELECT 
@@ -1733,7 +1931,7 @@ class CryptoDataPipeline:
                         anyLast(timestamp) OVER (PARTITION BY symbol ORDER BY timestamp
                             ROWS BETWEEN 1 FOLLOWING AND 1 FOLLOWING)
                     ) as hours_diff
-                FROM bn_{type}_klines
+                FROM {table_name}
             )
             SELECT 
                 symbol,
@@ -1741,7 +1939,7 @@ class CryptoDataPipeline:
                 next_timestamp as gap_end,
                 hours_diff as gap_hours
             FROM time_diffs
-            WHERE hours_diff > 1  -- Gap larger than expected interval
+            WHERE hours_diff > {interval}  -- Gap larger than expected interval
                 AND next_timestamp is not null
             ORDER BY gap_hours DESC
             --LIMIT 20  -- Show top 20 largest gaps
@@ -1799,45 +1997,109 @@ class CryptoDataPipeline:
         
         return extreme_df.head(10)
 
-
-'''
+"""
 from dotenv import load_dotenv
 load_dotenv()
 
-con = connect_clickhouse(
+with connect_clickhouse(
     host=os.environ['CLICKHOUSE_HOST'],
     port=os.environ['CLICKHOUSE_PORT'],
     database=os.environ['CLICKHOUSE_DATABASE'],
     username=os.environ['CLICKHOUSE_USERNAME'],
     password=os.environ['CLICKHOUSE_PASSWORD']
-)
+    ) as con:
+    
+    pipeline = CryptoDataPipeline(
+        con=con,
+        bn_api_key=os.environ['BINANCE_API_KEY'],
+        bn_api_secret=os.environ['BINANCE_API_SECRET']
+    )
+    pipeline.validate_data()
 
-pipeline = CryptoDataPipeline(
-    con=con, 
-    klines_interval='1h', 
-    bn_api_key=os.environ['BINANCE_API_KEY'], 
-    bn_api_secret=os.environ['BINANCE_API_SECRET']
-)
-#pipeline.update_all()
-#print(pipeline.fetcher.get_um_perpetual_symbols())
-#pipeline.update_market_data(pipeline.table_configs['bn_spot_symbols'])
-#pipeline.update_market_data(pipeline.table_configs['bn_perp_symbols'])
-#pipeline.update_market_data(
-#    pipeline.table_configs['bn_perp_klines'],
-#    start_time=None, #'2025-02-22 07:52:00',
-#    end_time='2020-01-03 00:00:00'
-#)
-pipeline.validate_data()
-df = pipeline.fetcher.get_historical_klines(
-    symbol='YFIUSDT',
-    start_time=int(pd.Timestamp('2020-11-30 00:00:00').timestamp()*1000),
-    end_time=int(pd.Timestamp('2020-11-30 12:00:00').timestamp()*1000),
-    interval='1h',
-    is_futures=False
-)
-df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-print(df[['symbol', 'timestamp', 'close', 'quote_volume']])
-'''
+    #df = pipeline.fetcher.get_options_symbols()
+    '''df = pipeline.fetcher.fetch_market_options_exercise_history_threadpool(
+        start_time=int(pd.Timestamp('2025-04-10 08:00:00').timestamp() * 1000),
+        end_time=int(pd.Timestamp('2025-05-10 00:00:00').timestamp() * 1000))
+    print(df.groupby(['underlying','expiryDate']).size())
+    '''
+
+    '''df = pipeline.fetcher.get_historical_klines(
+            symbol='FUNUSDT',
+            type='PERPETUAL',
+            interval='1h',
+            start_time='2025-03-25 08:00:00',
+            end_time='2025-04-05 08:00:00'
+        )
+    df.timestamp = pd.to_datetime(df.timestamp, unit='ms')
+    print(df.dtypes)
+    print(df)
+    '''
+    
+    '''
+    pipeline.update_market_data(
+        config=pipeline.table_configs['bn_option_symbols_active'], 
+        start_time=None, 
+        end_time=None
+    )
+    '''
+
+    '''
+    pipeline.update_market_data(
+        config=pipeline.table_configs['bn_option_symbols_exercised'], 
+        start_time=None, 
+        end_time=None
+    )
+    '''
+    
+    '''
+    pipeline.update_market_data(
+        config=pipeline.table_configs['bn_option_klines'], 
+        start_time='2024-01-01 00:00:00', 
+        end_time=None
+    )
+    '''
+    #print(pipeline.get_latest_update(pipeline.table_configs['bn_option_symbols_exercised']))
+    #print(clickhouse_query(con, 'show tables'))
+    #clickhouse_query(con, 'drop table if exists bn_option_symbols_exercised')
+    #clickhouse_query(con, 'drop table if exists bn_option_symbols_active')
+    table_name = 'bn_option_symbols_exercised'
+    ts_col = 'expiryDate'
+    df = clickhouse_query(con, f'select * from {table_name} order by {ts_col} desc limit 10')
+    print(df)
+    start_time = pipeline.get_latest_update(pipeline.table_configs[table_name])
+    print(start_time)
+    df = clickhouse_query(con, f'''select symbol, expiryDate 
+        from bn_option_symbols_active
+        where expiryDate >= '{start_time}' ''')
+    
+    print(df)
+    #print(df.groupby(['expiryDate','underlying','strikePrice']).size())
+    #print(con.execute(f"SELECT MAX(expiryDate) FROM bn_option_symbols_exercised"))
+    #pipeline.validate_data()
+"""
+
+"""    
+
+    #pipeline.update_all()
+    #print(pipeline.fetcher.get_um_perpetual_symbols())
+    #pipeline.update_market_data(pipeline.table_configs['bn_spot_symbols'])
+    #pipeline.update_market_data(pipeline.table_configs['bn_perp_symbols'])
+    #pipeline.update_market_data(
+    #    pipeline.table_configs['bn_perp_klines'],
+    #    start_time=None, #'2025-02-22 07:52:00',
+    #    end_time='2020-01-03 00:00:00'
+    #)
+    pipeline.validate_data()
+    df = pipeline.fetcher.get_historical_klines(
+        symbol='YFIUSDT',
+        start_time=int(pd.Timestamp('2020-11-30 00:00:00').timestamp()*1000),
+        end_time=int(pd.Timestamp('2020-11-30 12:00:00').timestamp()*1000),
+        interval='1h',
+        is_futures=False
+    )
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    print(df[['symbol', 'timestamp', 'close', 'quote_volume']])
+"""
 #print(pipeline.fetcher.get_margin_interest_rate('BNX', start_time=int(pd.Timestamp('2025-01-20 00:00:00').timestamp()*1000), end_time=int(pd.Timestamp('2025-02-20 00:00:00').timestamp()*1000)))
 #print(pipeline.fetcher.get_historical_margin_interest_rate('BNX', '2025-01-20 00:00:00', '2025-03-22 16:30:00', list_date=None, delist_date=None))
 #fetcher = BinanceDataFetcher(con=connect_clickhouse(), api_key=os.environ['BINANCE_API_KEY'], api_secret=os.environ['BINANCE_API_SECRET'])

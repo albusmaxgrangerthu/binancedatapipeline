@@ -8,6 +8,7 @@ import requests
 from pathlib import Path
 from utils import *
 from utils_clickhouse import *
+from config import *
 from crypto_data_pipline_clickhouse import CryptoDataPipeline
 
 # Configure logging
@@ -64,56 +65,55 @@ class TelegramNotifier:
 
 def job():
     """Main job function that runs the update pipeline"""
-    start_time = datetime.now()
+    start_time = time.time()
     notifier = TelegramNotifier()
     
     try:
         logger.info("Starting update job...")
         
         # Initialize pipeline
-        con = connect_clickhouse(
+        with connect_clickhouse(
             host=os.environ['CLICKHOUSE_HOST'],
             port=os.environ['CLICKHOUSE_PORT'],
             database=os.environ['CLICKHOUSE_DATABASE'],
             username=os.environ['CLICKHOUSE_USERNAME'],
             password=os.environ['CLICKHOUSE_PASSWORD']
-        )
-        logger.info("Database connection established")
+        ) as con:
+            logger.info("Database connection established")
 
-        pipeline = CryptoDataPipeline(
-            con=con, 
-            klines_interval='1h', 
-            bn_api_key=os.environ['BINANCE_API_KEY'], 
-            bn_api_secret=os.environ['BINANCE_API_SECRET']
-        )
-        logger.info("Pipeline initialized")
-        
-        # Run update
-        #pipeline.update_all()
-        # Run timely updates (5-minute data)
-        logger.info("\n****** Running 1-hour updates ******")
-        pipeline.update_all()
+            pipeline = CryptoDataPipeline(
+                con=con,
+                bn_api_key=os.environ['BINANCE_API_KEY'], 
+                bn_api_secret=os.environ['BINANCE_API_SECRET']
+            )
+            logger.info("Pipeline initialized")
+            
+            # Run update
+            #pipeline.update_all()
+            # Run timely updates (5-minute data)
+            logger.info("\n****** Running 1-hour updates ******")
+            pipeline.update_all()
 
-        message = (
-            "✅ Pipeline Update Successful\n\n"
-            f"⏱️ Execution Time: {(datetime.now() - start_time).total_seconds():.2f}s\n"
-            f"🔄 Updated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        )
-        
-        logger.info(message)
-        notifier.send_message(message)
+            message = (
+                "✅ Pipeline Update Successful\n\n"
+                f"⏱️ Execution Time: {(time.time() - start_time):.2f}s\n"
+                f"🔄 Updated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            )
+            
+            logger.info(message)
+            #notifier.send_message(message)
         
     except Exception as e:
         # Prepare error message
         error_message = (
             "❌ Pipeline Update Failed\n\n"
             f"⚠️ Error: {str(e)}\n"
-            f"⏱️ Failed after: {(datetime.now() - start_time).total_seconds():.2f}s\n"
+            f"⏱️ Failed after: {(time.time() - start_time):.2f}s\n"
             f"🕒 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
         
         logger.error(error_message)
-        notifier.send_message(error_message)
+        #notifier.send_message(error_message)
         raise
 
 if __name__ == "__main__":
@@ -121,14 +121,14 @@ if __name__ == "__main__":
     scheduler = BlockingScheduler()
     
     now = datetime.now()
-    run_immediate = now.minute >= 58
-    next_run = now if run_immediate else now.replace(minute=58, second=0, microsecond=0)
+    run_immediate = now.minute >= update_minute
+    next_run = now if run_immediate else now.replace(minute=update_minute, second=0, microsecond=0)
     
     # Add job to run at minute 58 of every hour
     job = scheduler.add_job(
         job, 
         'cron', 
-        minute='58',
+        minute=f'{update_minute}',
         next_run_time=next_run
     )
     
