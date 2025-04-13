@@ -32,4 +32,4 @@ ENV PYTHONUNBUFFERED=1
 #ENV TZ=UTC
 
 # Command to run when container starts
-CMD ["python", "src/scheduler.py"]
+CMD ["python", "src/scheduler_clickhouse.py"]

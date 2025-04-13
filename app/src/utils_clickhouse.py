@@ -32,3 +32,4 @@ def clickhouse_query(client, query, params=None):
     end_time = time.time()
     print(f'Elapsed time: {end_time - start_time:.4f} seconds')
     return df
+

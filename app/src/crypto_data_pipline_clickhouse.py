@@ -2111,3 +2111,5 @@ with connect_clickhouse(
 #print(fetcher.get_historical_margin_interest_rate('FORM', '2025-01-20 00:00:00', '2025-03-22 16:30:00', list_date=None, delist_date=None))
 
 #print(fetcher.get_funding_rate('FORM', int(pd.Timestamp('2025-01-20 00:00:00').timestamp()*1000), int(pd.Timestamp('2025-02-20 00:00:00').timestamp()*1000)))
+#con = connect_clickhouse()
+#con.disconnect()
